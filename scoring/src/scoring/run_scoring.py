@@ -1379,25 +1379,8 @@ def run_prescoring(
     useStableInitialization=useStableInitialization,
   )
 
-  # Attempt to convert IDs to Int64 before prescoring.  We expect this to succeed in production,
-  # fail when running on public data and fail in some unit tests.
-  conversion = False
-  try:
-    # Complete all three conversions before doing any updates, so if there are any errors the
-    # updates don't happen.
-    ratingIds = ratings[c.raterParticipantIdKey].astype(pd.Int64Dtype())
-    noteStatusHistoryIds = noteStatusHistory[c.noteAuthorParticipantIdKey].astype(pd.Int64Dtype())
-    userEnrollmentIds = userEnrollment[c.participantIdKey].astype(pd.Int64Dtype())
-    ratings[c.raterParticipantIdKey] = ratingIds
-    noteStatusHistory[c.noteAuthorParticipantIdKey] = noteStatusHistoryIds
-    userEnrollment[c.participantIdKey] = userEnrollmentIds
-    del ratingIds, noteStatusHistoryIds, userEnrollmentIds
-    logger.info(
-      "User IDs for ratings, noteStatusHistory and userEnrollment converted to Int64Dtype."
-    )
-    conversion = True
-  except ValueError as e:
-    logger.info(f"Error converting user IDs to ints.  IDs will remain as strings. {repr(e)}")
+  # Note: participant ID type optimization is now handled upstream by id_mapping.
+  # String IDs (public data) are mapped to sequential int64 values before scoring begins.
   with c.time_block("Logging Prescoring Inputs RAM usage before _run_scorers"):
     logger.info(get_df_info(notes, "notes"))
     logger.info(get_df_info(ratings, "ratings"))
@@ -1428,28 +1411,7 @@ def run_prescoring(
   del scorers
   gc.collect()
 
-  with c.time_block("Logging Prescoring Results RAM usage (before conversion)"):
-    logger.info(get_df_info(notes, "notes"))
-    logger.info(get_df_info(ratings, "ratings"))
-    logger.info(get_df_info(noteStatusHistory, "noteStatusHistory"))
-    logger.info(get_df_info(userEnrollment, "userEnrollment"))
-    logger.info(get_df_info(prescoringNoteModelOutput, "prescoringNoteModelOutput"))
-    logger.info(get_df_info(prescoringRaterModelOutput, "prescoringRaterModelOutput"))
-  # Restore IDs as string objects now that prescoring is over and memory pressure is relaxed.
-  if conversion:
-    logger.info("Restoring string IDs.")
-    ratings[c.raterParticipantIdKey] = ratings[c.raterParticipantIdKey].astype(str)
-    noteStatusHistory[c.noteAuthorParticipantIdKey] = noteStatusHistory[
-      c.noteAuthorParticipantIdKey
-    ].astype(str)
-    userEnrollment[c.participantIdKey] = userEnrollment[c.participantIdKey].astype(str)
-    # Notice that we also do conversion on the prescoring results.
-    prescoringRaterModelOutput[c.raterParticipantIdKey] = prescoringRaterModelOutput[
-      c.raterParticipantIdKey
-    ].astype(str)
-    logger.info("Restoration of original string IDs complete.")
-
-  with c.time_block("Logging Prescoring Results RAM usage (after conversion)"):
+  with c.time_block("Logging Prescoring Results RAM usage"):
     logger.info(get_df_info(notes, "notes"))
     logger.info(get_df_info(ratings, "ratings"))
     logger.info(get_df_info(noteStatusHistory, "noteStatusHistory"))
@@ -1502,7 +1464,6 @@ def run_prescoring(
       ].dropna(),
     )
     logger.info(f"recent core ratings for empirical prior {len(priorRatings)}")
-    priorRatings[c.raterParticipantIdKey] = priorRatings[c.raterParticipantIdKey].astype(str)
     priorRatings = (
       priorRatings[[c.noteIdKey, c.raterParticipantIdKey, c.helpfulNumKey]]
       .merge(
