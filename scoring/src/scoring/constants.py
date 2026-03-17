@@ -631,6 +631,7 @@ agreeKey = "agree"
 disagreeKey = "disagree"
 ratedOnTweetIdKey = "ratedOnTweetId"
 ratingSourceBucketedKey = "ratingSourceBucketed"
+suggestionKey = "suggestion"
 ratingTSVColumnsAndTypes = (
   [
     (noteIdKey, np.int64),
@@ -645,7 +646,7 @@ ratingTSVColumnsAndTypes = (
   ]
   + helpfulTagBoolsAndTypesTSVOrder
   + notHelpfulTagsAndTypesTSVOrder
-  + [(ratedOnTweetIdKey, np.int64), (ratingSourceBucketedKey, "category")]
+  + [(ratedOnTweetIdKey, np.int64), (ratingSourceBucketedKey, "category"), (suggestionKey, object)]
 )
 
 ratingTSVColumns = [col for (col, dtype) in ratingTSVColumnsAndTypes]
