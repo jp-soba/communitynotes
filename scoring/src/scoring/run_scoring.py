@@ -1381,6 +1381,13 @@ def run_prescoring(
 
   # Note: participant ID type optimization is now handled upstream by id_mapping.
   # String IDs (public data) are mapped to sequential int64 values before scoring begins.
+
+  # Drop note summary text during prescoring to save memory.
+  # It is not needed until final scoring (topic assignment).
+  if c.summaryKey in notes.columns:
+    logger.info("Dropping note summary column to save memory.")
+    notes = notes.drop(columns=[c.summaryKey])
+
   with c.time_block("Logging Prescoring Inputs RAM usage before _run_scorers"):
     logger.info(get_df_info(notes, "notes"))
     logger.info(get_df_info(ratings, "ratings"))
