@@ -204,6 +204,13 @@ def parse_args():
     dest="resume_from_prescoring",
     help="Resume from a saved prescoring checkpoint (requires --prescoring-dir).",
   )
+  parser.add_argument(
+    "--stop-after-prescoring",
+    default=False,
+    action="store_true",
+    dest="stop_after_prescoring",
+    help="Stop after prescoring and saving checkpoint (requires --prescoring-dir). Skips final scoring and contributor scoring.",
+  )
   return parser.parse_args()
 
 
@@ -288,6 +295,7 @@ def _run_scorer(
     # Build prescoring save callback if --prescoring-dir is set.
     prescoringCallback = None
     prescoringDir = getattr(args, "prescoring_dir", None)
+    stopAfterPrescoring = getattr(args, "stop_after_prescoring", False)
     if prescoringDir is not None:
       os.makedirs(prescoringDir, exist_ok=True)
       def prescoringCallback(
@@ -298,6 +306,9 @@ def _run_scorer(
           prescoringDir, noteModel, raterModel, topicClassifier,
           pflipClassifier, metaOutput, scoredNotesOutput, empiricalTotals,
         )
+        if stopAfterPrescoring:
+          logger.info("--stop-after-prescoring: exiting after saving checkpoint.")
+          sys.exit(0)
 
     # Invoke scoring and user contribution algorithms.
     scoredNotes, helpfulnessScores, newStatus, auxNoteInfo = run_scoring(
