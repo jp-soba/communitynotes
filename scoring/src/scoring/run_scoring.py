@@ -393,9 +393,10 @@ def save_df_to_shared_memory(df: pd.DataFrame, shms: List) -> c.SharedMemoryData
   """
   with io.BytesIO() as buf:
     df.to_parquet(buf, compression="gzip", engine="pyarrow")
-    size = len(buf.getvalue())
+    data = buf.getvalue()
+    size = len(data)
     shm = shared_memory.SharedMemory(create=True, size=size)
-    shm.buf[:size] = buf.getvalue()
+    shm.buf[:size] = data
   shms.append(shm)  # save the shared memory object so we can close it later
   return c.SharedMemoryDataframeInfo(
     sharedMemoryName=shm.name,
