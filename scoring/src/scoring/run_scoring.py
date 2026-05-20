@@ -34,6 +34,7 @@ from .mf_group_scorer import (
   groupScorerCount,
   groupScorerParalleism,
   nmrScoringGroup,
+  nmrTrialScoringGroup,
   trialScoringGroup,
 )
 from .mf_multi_group_scorer import (
@@ -42,7 +43,7 @@ from .mf_multi_group_scorer import (
   coalesce_multi_group_model_scored_notes,
 )
 from .mf_topic_scorer import MFTopicScorer, coalesce_topic_models
-from .pandas_utils import get_df_fingerprint, get_df_info, keep_columns, patch_pandas
+from .pandas_utils import get_df_fingerprint, get_df_info, keep_columns
 from .pflip_plus_model import LABEL as PFLIP_LABEL, PFlipPlusModel
 from .post_selection_similarity import PostSelectionSimilarity, apply_post_selection_similarity
 from .process_data import CommunityNotesDataLoader, filter_input_data_for_testing, preprocess_data
@@ -94,7 +95,9 @@ def _get_scorers(
     MFExpansionScorer(seed, useStableInitialization=useStableInitialization, threads=12)
   ]
   scorers[Scorers.MFExpansionPlusScorer] = [
-    MFExpansionPlusScorer(seed, useStableInitialization=useStableInitialization, threads=12)
+    MFExpansionPlusScorer(
+      seed, useStableInitialization=useStableInitialization, threads=12, crhSuperThreshold=0.6
+    )
   ]
   scorers[Scorers.ReputationScorer] = [
     ReputationScorer(seed, useStableInitialization=useStableInitialization, threads=12)
@@ -124,7 +127,7 @@ def _get_scorers(
         globalSignNorm=True, noteSignAlpha=None, noteNormExp=0, raterNormExp=-0.25
       ),
       maxFinalMFTrainError=0.16,
-      groupThreshold=0.4,
+      groupThreshold=0.51,
       minMeanNoteScore=-0.01,
       crhThreshold=0.15,
       crhSuperThreshold=None,
@@ -150,6 +153,23 @@ def _get_scorers(
       groupId=nmrScoringGroup,
       threads=groupScorerParalleism.get(nmrScoringGroup, 4),
       seed=seed,
+    )
+  )
+  scorers[Scorers.MFGroupScorer].append(
+    MFGroupScorer(
+      includedGroups={nmrTrialScoringGroup},
+      groupId=nmrTrialScoringGroup,
+      threads=groupScorerParalleism.get(nmrTrialScoringGroup, 4),
+      seed=seed,
+      noteInterceptLambda=0.03 * 5,
+      userInterceptLambda=0.03,
+      globalInterceptLambda=0,
+      noteFactorLambda=0.03,
+      userFactorLambda=0.03,
+      crhThreshold=0.2,
+      crhThresholdNoHighVol=0.18,
+      crhThresholdNoCorrelated=0.18,
+      groupThreshold=0.51,
     )
   )
   topicScorers: List[Scorer] = []
@@ -212,22 +232,8 @@ def _merge_results(
     c.noteIdKey
   }, "column names must be globally unique"
   scoredNotesSize = len(scoredNotes)
-  unsafeAllowed = set(
-    [
-      c.noteIdKey,
-      c.defaultIndexKey,
-    ]
-    + [f"{c.modelingGroupKey}_{group}" for group in range(groupScorerCount, 0, -1)]
-    + [f"{c.topicNoteConfidentKey}_{topic.name}" for topic in Topics]
-    + [f"{c.groupNumFinalRoundRatingsKey}_{group}" for group in range(groupScorerCount, 0, -1)]
-    + [f"{c.topicNumFinalRoundRatingsKey}_{topic.name}" for topic in Topics]
-  )
-  scoredNotes = scoredNotes.merge(
-    modelScoredNotes,
-    on=c.noteIdKey,
-    how="outer",
-    unsafeAllowed=unsafeAllowed,
-  )
+  scoredNotes = scoredNotes.merge(modelScoredNotes, on=c.noteIdKey, how="outer")
+
   assert len(scoredNotes) == scoredNotesSize, "scoredNotes should not expand"
 
   # Merge auxiliaryNoteInfo
@@ -294,15 +300,17 @@ def _load_data_from_shared_memory_parallelizable(
 
 
 # patch_pandas is needed since we're using 'forkserver' to create new process.
-@patch_pandas
 def _run_scorer_in_parallel(
   args,
   scorer: Scorer,
   scoringArgs: ScoringArgs,
   dataLoader: Optional[CommunityNotesDataLoader] = None,
   scoringArgsSharedMemory=None,
+  special_handler_process_name: Optional[str] = None,
 ) -> Tuple[ModelResult, float]:
-  return _run_scorer_parallelizable(scorer, True, scoringArgs, dataLoader, scoringArgsSharedMemory)
+  return _run_scorer_parallelizable(
+    scorer, True, scoringArgs, dataLoader, scoringArgsSharedMemory, special_handler_process_name
+  )
 
 
 def _run_scorer_in_series(
@@ -320,6 +328,7 @@ def _run_scorer_parallelizable(
   scoringArgs: ScoringArgs,
   dataLoader: Optional[CommunityNotesDataLoader] = None,
   scoringArgsSharedMemory=None,
+  special_handler_process_name: Optional[str] = None,
 ) -> Tuple[ModelResult, float]:
   """
   Run scoring (either prescoring or final scoring) for a single scorer.
@@ -341,7 +350,7 @@ def _run_scorer_parallelizable(
     try:
       from twitter.logging_config import configure_logging_for_child_process
 
-      configure_logging_for_child_process()
+      configure_logging_for_child_process(special_handler_process_name)
     except ImportError:
       pass
   scorerStartTime = time.perf_counter()
@@ -413,7 +422,7 @@ def get_df_from_shared_memory(
   existing_shm = shared_memory.SharedMemory(name=sharedMemoryDfInfo.sharedMemoryName)
   size = sharedMemoryDfInfo.dataSize
   with io.BytesIO(existing_shm.buf[:size]) as buf:
-    return pd.read_parquet(buf)
+    return pd.read_parquet(buf, dtype_backend="pyarrow")
 
 
 def _save_dfs_to_shared_memory(
@@ -500,6 +509,19 @@ def _run_scorers(
   overallStartTime = time.perf_counter()
 
   if runParallel:
+    # Discover the SpecialHandler process name so child processes can create local
+    # FileHandlers whose output will be aggregated by SpecialHandler.close().
+    special_handler_process_name = None
+    try:
+      from twitter.data_util import SpecialHandler as _SH
+
+      for h in logging.getLogger("birdwatch").handlers:
+        if isinstance(h, _SH):
+          special_handler_process_name = h.processName
+          break
+    except ImportError:
+      pass
+
     shms, scoringArgsSharedMemory = _save_dfs_to_shared_memory(scoringArgs)
 
     with concurrent.futures.ProcessPoolExecutor(
@@ -518,6 +540,7 @@ def _run_scorers(
           scoringArgs=copy.deepcopy(scoringArgs),
           dataLoader=dataLoader,
           scoringArgsSharedMemory=copy.deepcopy(scoringArgsSharedMemory),
+          special_handler_process_name=special_handler_process_name,
         )
         for scorer in scorers
       ]
@@ -583,17 +606,7 @@ def combine_prescorer_scorer_results(
     if modelResult.metaScores is not None and modelResult.scorerName is not None:
       prescoringMetaOutput.metaScorerOutput[modelResult.scorerName] = modelResult.metaScores
 
-  prescoringNoteModelOutput = pd.concat(
-    prescoringNoteModelOutputList,
-    unsafeAllowed={
-      c.defaultIndexKey,
-      c.noteIdKey,
-      c.internalNoteInterceptKey,
-      c.internalNoteFactor1Key,
-      c.lowDiligenceNoteInterceptKey,
-      c.lowDiligenceNoteFactor1Key,
-    },
-  )
+  prescoringNoteModelOutput = pd.concat(prescoringNoteModelOutputList)
   # BUG: The type error for this concat operation shows a mix of Int64 and float64 values in
   # some columns, suggesting that an input may be emtpy.  The type error is preceeded by this
   # warning from Pandas, which also points to an empty input:
@@ -606,21 +619,6 @@ def combine_prescorer_scorer_results(
   # and raterParticipantId mixes Int64 and object.
   raterParamsUnfilteredMultiScorers = pd.concat(
     raterParamsUnfilteredMultiScorersList,
-    unsafeAllowed={
-      c.defaultIndexKey,
-      c.internalRaterInterceptKey,
-      c.internalRaterFactor1Key,
-      c.crhCrnhRatioDifferenceKey,
-      c.meanNoteScoreKey,
-      c.raterAgreeRatioKey,
-      c.aboveHelpfulnessThresholdKey,
-      c.internalRaterReputationKey,
-      c.lowDiligenceRaterInterceptKey,
-      c.lowDiligenceRaterFactor1Key,
-      c.lowDiligenceRaterReputationKey,
-      c.incorrectTagRatingsMadeByRaterKey,
-      c.raterParticipantIdKey,
-    },
   )
   return (
     prescoringNoteModelOutput[c.prescoringNoteModelOutputTSVColumns],
@@ -707,7 +705,6 @@ def convert_prescoring_rater_model_output_to_coalesced_helpfulness_scores(
         scorerOutputExternalNames,
         on=c.raterParticipantIdKey,
         how="outer",
-        unsafeAllowed=scorer._modelingGroupKey,
       )
     else:
       helpfulnessScores = helpfulnessScores.merge(
@@ -871,6 +868,24 @@ def meta_score(
           RuleID[f"GROUP_MODEL_{nmrScoringGroup}_NMR"],
           {RuleID.EXPANSION_MODEL, RuleID.CORE_MODEL},
           nmrScoringGroup,
+        )
+      )
+      # group 18 scorers
+      # rules.append(
+      #   scoring_rules.ApplyGroupModelResult(
+      #     RuleID[f"GROUP_MODEL_{nmrTrialScoringGroup}"],
+      #     {RuleID.EXPANSION_MODEL, RuleID.CORE_MODEL},
+      #     nmrTrialScoringGroup,
+      #     None,
+      #     None,
+      #     minSafeguardThreshold=0.25,
+      #   )
+      # )
+      rules.append(
+        scoring_rules.ApplyNMRGroupModelResult(
+          RuleID[f"GROUP_MODEL_{nmrTrialScoringGroup}_NMR"],
+          {RuleID.EXPANSION_MODEL, RuleID.CORE_MODEL},
+          nmrTrialScoringGroup,
         )
       )
     if enabledScorers is None or Scorers.GaussianScorer in enabledScorers:
@@ -1058,16 +1073,22 @@ def _compute_note_stats(
   return scoredNotesCols, auxiliaryNoteInfoCols
 
 
-def _compute_14d_stats(
+def _compute_past_n_days_stats(
   ratings: pd.DataFrame,
   noteStatusHistory: pd.DataFrame,
+  nDays: int,
+  onlyIncludeNotesWithStatusOrEnoughRatings: bool,
+  crhCountColumn: str,
+  crnhCountColumn: str,
+  nmrCountColumn: str,
 ) -> pd.DataFrame:
-  """Helper function to compute 14d CRH, CRNH and NMR totals.
+  """Helper function to compute past n days' CRH, CRNH and NMR totals.
 
-  Only notes written in the last 14 days count, and a note must either have status or
-  at least 10 ratings to count towards the totals.
+  Only notes written in the last n days count, and if
+  onlyIncludeNotesWithStatusOrEnoughRatings is True, a note must either
+  have status or at least 10 ratings to count towards the totals.
   """
-  cutoff = noteStatusHistory[c.createdAtMillisKey].max() - (1000 * 60 * 60 * 24 * 14)
+  cutoff = noteStatusHistory[c.createdAtMillisKey].max() - (1000 * 60 * 60 * 24 * nDays)
   # Purge notes that are too old
   recentStats = (
     noteStatusHistory[noteStatusHistory[c.createdAtMillisKey] > cutoff][
@@ -1076,19 +1097,22 @@ def _compute_14d_stats(
     .rename(columns={c.noteAuthorParticipantIdKey: c.raterParticipantIdKey})
     .copy()
   )
-  # Purge notes that either lack status or too few ratings
-  ratingTotals = ratings[c.noteIdKey].value_counts().to_frame().reset_index(drop=False)
-  recentStats = recentStats.merge(
-    ratingTotals, how="inner", on=c.noteIdKey
-  )  # Implicitly drop notes with 0 ratings
-  recentStats = recentStats[
-    (recentStats["count"] >= 10)
-    | (recentStats[c.currentLabelKey].isin({c.currentlyRatedHelpful, c.currentlyRatedNotHelpful}))
-  ].drop(columns=[c.noteIdKey, "count"])
+  if onlyIncludeNotesWithStatusOrEnoughRatings:
+    # Purge notes that either lack status or too few ratings
+    ratingTotals = ratings[c.noteIdKey].value_counts().to_frame().reset_index(drop=False)
+    recentStats = recentStats.merge(
+      ratingTotals, how="inner", on=c.noteIdKey
+    )  # Implicitly drop notes with 0 ratings
+    recentStats = recentStats[
+      (recentStats["count"] >= 10)
+      | (recentStats[c.currentLabelKey].isin({c.currentlyRatedHelpful, c.currentlyRatedNotHelpful}))
+    ].drop(columns=[c.noteIdKey, "count"])
+  else:
+    recentStats = recentStats.drop(columns=[c.noteIdKey])
   # Compute totals
-  recentStats[c.crhTotal14dKey] = recentStats[c.currentLabelKey] == c.currentlyRatedHelpful
-  recentStats[c.crnhTotal14dKey] = recentStats[c.currentLabelKey] == c.currentlyRatedNotHelpful
-  recentStats[c.nmrTotal14dKey] = recentStats[c.currentLabelKey] == c.needsMoreRatings
+  recentStats[crhCountColumn] = recentStats[c.currentLabelKey] == c.currentlyRatedHelpful
+  recentStats[crnhCountColumn] = recentStats[c.currentLabelKey] == c.currentlyRatedNotHelpful
+  recentStats[nmrCountColumn] = recentStats[c.currentLabelKey] == c.needsMoreRatings
   recentStats = (
     recentStats.drop(columns=[c.currentLabelKey])
     .groupby(c.raterParticipantIdKey)
@@ -1152,6 +1176,14 @@ def _compute_helpfulness_scores(
       ]
     ]
     assert len(scoredNotesWithStats) == len(scoredNotes)
+    # Ensure boolean columns are bool dtype for downstream boolean operations.
+    # After TSV round-trip these may be int8[pyarrow] which doesn't support | operator.
+    for col in [
+      c.currentlyRatedHelpfulBoolKey,
+      c.currentlyRatedNotHelpfulBoolKey,
+      c.awaitingMoreRatingsBoolKey,
+    ]:
+      scoredNotesWithStats[col] = scoredNotesWithStats[col].astype(bool)
 
   with c.time_block("Meta Helpfulness Scores: Contributor Scores"):
     # Return one row per rater with stats including trackrecord identifying note labels.
@@ -1187,7 +1219,6 @@ def _compute_helpfulness_scores(
       ],
       on=c.raterParticipantIdKey,
       how="outer",
-      unsafeAllowed={c.enrollmentState, c.isEmergingWriterKey},
     )
     contributorScores = contributor_state.single_trigger_earn_out(contributorScores)
     contributorScores = contributor_state.calculate_ri_to_earn_in(contributorScores)
@@ -1204,7 +1235,6 @@ def _compute_helpfulness_scores(
       left_on=c.raterParticipantIdKey,
       right_on=c.participantIdKey,
       how="left",
-      unsafeAllowed=(c.enrollmentState + "_prev"),
     ).drop(c.participantIdKey, axis=1)
 
     # For users who did not earn a new enrollmentState, carry over the previous one
@@ -1217,12 +1247,13 @@ def _compute_helpfulness_scores(
     helpfulnessScores[c.timestampOfLastEarnOut].fillna(1, inplace=True)
 
   with c.time_block("Computing 14d contributor stats"):
-    recentStats = _compute_14d_stats(ratings, noteStatusHistory)
+    recentStats = _compute_past_n_days_stats(
+      ratings, noteStatusHistory, 14, True, c.crhTotal14dKey, c.crnhTotal14dKey, c.nmrTotal14dKey
+    )
     helpfulnessScores = helpfulnessScores.merge(
       recentStats,
       how="left",
       on=c.raterParticipantIdKey,
-      unsafeAllowed={c.crhTotal14dKey, c.crnhTotal14dKey, c.nmrTotal14dKey},
     )
     helpfulnessScores = helpfulnessScores.fillna(
       {c.crhTotal14dKey: 0.0, c.crnhTotal14dKey: 0.0, c.nmrTotal14dKey: 0.0}
@@ -1231,6 +1262,30 @@ def _compute_helpfulness_scores(
         c.crhTotal14dKey: pd.Int64Dtype(),
         c.crnhTotal14dKey: pd.Int64Dtype(),
         c.nmrTotal14dKey: pd.Int64Dtype(),
+      }
+    )
+  with c.time_block("Computing 90d contributor stats"):
+    recentStats = _compute_past_n_days_stats(
+      ratings,
+      noteStatusHistory,
+      90,
+      False,
+      c.crhTotal90dKey,
+      c.crnhTotal90dKey,
+      c.nmrTotal90dKey,
+    )
+    helpfulnessScores = helpfulnessScores.merge(
+      recentStats,
+      how="left",
+      on=c.raterParticipantIdKey,
+    )
+    helpfulnessScores = helpfulnessScores.fillna(
+      {c.crhTotal90dKey: 0.0, c.crnhTotal90dKey: 0.0, c.nmrTotal90dKey: 0.0}
+    ).astype(
+      {
+        c.crhTotal90dKey: pd.Int64Dtype(),
+        c.crnhTotal90dKey: pd.Int64Dtype(),
+        c.nmrTotal90dKey: pd.Int64Dtype(),
       }
     )
 
@@ -1248,9 +1303,9 @@ def _add_deprecated_columns(scoredNotes: pd.DataFrame) -> pd.DataFrame:
   """
   for column, columnType in c.deprecatedNoteModelOutputTSVColumnsAndTypes:
     assert column not in scoredNotes.columns
-    if columnType == np.double:
+    if columnType == "double[pyarrow]":
       scoredNotes[column] = np.nan
-    elif columnType == str:
+    elif columnType == "string[pyarrow]":
       scoredNotes[column] = ""
     elif columnType == "category":
       scoredNotes[column] = np.nan
@@ -1312,6 +1367,46 @@ def run_rater_clustering(notes: pd.DataFrame, ratings: pd.DataFrame) -> pd.DataF
     gc.collect()
   # Return combined dataframe
   return postSelectionSimilarityValues.merge(quasiCliques, how="outer")
+
+
+def _build_participant_id_codebook(framesAndColumns):
+  """Replace string participant IDs with int64[pyarrow] codes in place, sharing one codebook.
+
+  Generalizes the prod int64[pyarrow] ID optimization to public data, whose participant IDs are
+  non-numeric strings that astype("int64[pyarrow]") cannot convert. Scoring uses participant IDs
+  only as equality/join/group keys, and prod already runs scoring with int64 IDs (restoring
+  strings only for output), so replacing IDs with a consistent bijective integer encoding leaves
+  the scoring output unchanged. A single shared codebook across all columns guarantees the same
+  original ID maps to the same code everywhere (e.g. a note author who is also a rater). Null
+  values are preserved as null.
+
+  Args:
+    framesAndColumns: list of (DataFrame, column name) pairs to encode in place.
+
+  Returns:
+    pd.Index mapping code -> original value, for later decoding with _decode_participant_ids.
+  """
+  combined = pd.concat([df[column] for df, column in framesAndColumns], ignore_index=True)
+  _, codebook = pd.factorize(combined, use_na_sentinel=True)
+  valueToCode = pd.Series(range(len(codebook)), index=codebook)
+  for df, column in framesAndColumns:
+    df[column] = df[column].map(valueToCode).astype("int64[pyarrow]")
+  return codebook
+
+
+def _decode_participant_ids(framesAndColumns, codebook):
+  """Inverse of _build_participant_id_codebook: restore original string IDs from int codes.
+
+  Null codes are preserved as null. The result matches the existing astype(str) restoration so
+  downstream/output behavior is unchanged.
+  """
+  codebookValues = codebook.to_numpy()
+  for df, column in framesAndColumns:
+    codes = df[column]
+    mask = codes.notna()
+    restored = pd.Series(pd.NA, index=codes.index, dtype="object")
+    restored[mask] = codebookValues[codes[mask].astype("int64").to_numpy()]
+    df[column] = restored.astype(str)
 
 
 def run_prescoring(
@@ -1382,22 +1477,34 @@ def run_prescoring(
   # Attempt to convert IDs to Int64 before prescoring.  We expect this to succeed in production,
   # fail when running on public data and fail in some unit tests.
   conversion = False
+  idCodebook = None
   try:
     # Complete all three conversions before doing any updates, so if there are any errors the
     # updates don't happen.
-    ratingIds = ratings[c.raterParticipantIdKey].astype(pd.Int64Dtype())
-    noteStatusHistoryIds = noteStatusHistory[c.noteAuthorParticipantIdKey].astype(pd.Int64Dtype())
-    userEnrollmentIds = userEnrollment[c.participantIdKey].astype(pd.Int64Dtype())
+    ratingIds = ratings[c.raterParticipantIdKey].astype("int64[pyarrow]")
+    noteStatusHistoryIds = noteStatusHistory[c.noteAuthorParticipantIdKey].astype("int64[pyarrow]")
+    userEnrollmentIds = userEnrollment[c.participantIdKey].astype("int64[pyarrow]")
     ratings[c.raterParticipantIdKey] = ratingIds
     noteStatusHistory[c.noteAuthorParticipantIdKey] = noteStatusHistoryIds
     userEnrollment[c.participantIdKey] = userEnrollmentIds
     del ratingIds, noteStatusHistoryIds, userEnrollmentIds
     logger.info(
-      "User IDs for ratings, noteStatusHistory and userEnrollment converted to Int64Dtype."
+      "User IDs for ratings, noteStatusHistory and userEnrollment converted to int64[pyarrow]."
     )
     conversion = True
   except ValueError as e:
-    logger.info(f"Error converting user IDs to ints.  IDs will remain as strings. {repr(e)}")
+    logger.info(f"Error converting user IDs to ints. Falling back to a factorized codebook. {repr(e)}")
+    # On public data the IDs are non-numeric strings, so factorize them to ints instead. This is
+    # result-neutral (prod runs scoring on int IDs too) and restored to strings before output.
+    idCodebook = _build_participant_id_codebook(
+      [
+        (ratings, c.raterParticipantIdKey),
+        (noteStatusHistory, c.noteAuthorParticipantIdKey),
+        (userEnrollment, c.participantIdKey),
+      ]
+    )
+    conversion = True
+    logger.info("User IDs factorized to int64[pyarrow] using a shared codebook.")
   with c.time_block("Logging Prescoring Inputs RAM usage before _run_scorers"):
     logger.info(get_df_info(notes, "notes"))
     logger.info(get_df_info(ratings, "ratings"))
@@ -1438,15 +1545,27 @@ def run_prescoring(
   # Restore IDs as string objects now that prescoring is over and memory pressure is relaxed.
   if conversion:
     logger.info("Restoring string IDs.")
-    ratings[c.raterParticipantIdKey] = ratings[c.raterParticipantIdKey].astype(str)
-    noteStatusHistory[c.noteAuthorParticipantIdKey] = noteStatusHistory[
-      c.noteAuthorParticipantIdKey
-    ].astype(str)
-    userEnrollment[c.participantIdKey] = userEnrollment[c.participantIdKey].astype(str)
-    # Notice that we also do conversion on the prescoring results.
-    prescoringRaterModelOutput[c.raterParticipantIdKey] = prescoringRaterModelOutput[
-      c.raterParticipantIdKey
-    ].astype(str)
+    if idCodebook is not None:
+      # Public-data path: restore original strings via the factorized codebook.
+      _decode_participant_ids(
+        [
+          (ratings, c.raterParticipantIdKey),
+          (noteStatusHistory, c.noteAuthorParticipantIdKey),
+          (userEnrollment, c.participantIdKey),
+          (prescoringRaterModelOutput, c.raterParticipantIdKey),
+        ],
+        idCodebook,
+      )
+    else:
+      ratings[c.raterParticipantIdKey] = ratings[c.raterParticipantIdKey].astype(str)
+      noteStatusHistory[c.noteAuthorParticipantIdKey] = noteStatusHistory[
+        c.noteAuthorParticipantIdKey
+      ].astype(str)
+      userEnrollment[c.participantIdKey] = userEnrollment[c.participantIdKey].astype(str)
+      # Notice that we also do conversion on the prescoring results.
+      prescoringRaterModelOutput[c.raterParticipantIdKey] = prescoringRaterModelOutput[
+        c.raterParticipantIdKey
+      ].astype(str)
     logger.info("Restoration of original string IDs complete.")
 
   with c.time_block("Logging Prescoring Results RAM usage (after conversion)"):
@@ -1459,9 +1578,6 @@ def run_prescoring(
 
   prescoringRaterModelOutput = pd.concat(
     [prescoringRaterModelOutput, postSelectionSimilarityValues],
-    unsafeAllowed={
-      c.postSelectionValueKey,
-    },
   )
   with c.time_block("Logging Prescoring Results RAM usage (after concatenation)"):
     logger.info(get_df_info(prescoringRaterModelOutput, "prescoringRaterModelOutput"))
@@ -1592,8 +1708,6 @@ def run_contributor_scoring(
 
 
 def determine_which_notes_to_rescore(
-  notes: pd.DataFrame,
-  ratings: pd.DataFrame,
   noteStatusHistory: pd.DataFrame,
   previousRatingCutoffTimestampMillis: Optional[int] = None,
   scoreRecentNotesMinimumFrequencyMillis: Optional[int] = 1000 * 60 * 60 * 24,  # 1 day
@@ -1601,12 +1715,23 @@ def determine_which_notes_to_rescore(
   scoreRecentlyFlippedNotesMinimumFrequencyMillis: Optional[int] = 1000 * 60 * 60 * 1,  # 1 hour
   recentlyFlippedNoteAgeCutoffMillis: Optional[int] = 1000 * 60 * 60 * 24,  # 1 day
   lockingRescoreWindowMillis: int = 1000 * 60 * 60 * 24 * 7,  # 7 days
-) -> Tuple[List[c.NoteSubset], set]:
+  precomputedNotesWithNewRatings: Optional[set] = None,
+  ratings: Optional[
+    pd.DataFrame
+  ] = None,  # Required when precomputedNotesWithNewRatings is not provided.
+) -> c.NotesToRescore:
   notesToRescoreSet = set()
   noteSubsets = []
 
   # 1. Rescore all notes with a new rating since last scoring run.
-  if previousRatingCutoffTimestampMillis is not None:
+  if precomputedNotesWithNewRatings is not None:
+    notesWithNewRatings = precomputedNotesWithNewRatings
+    logger.info(f"1. Num notes with new ratings (precomputed): {len(notesWithNewRatings)}")
+    notesToRescoreSet.update(notesWithNewRatings)
+  elif previousRatingCutoffTimestampMillis is not None:
+    assert (
+      ratings is not None
+    ), "ratings required when precomputedNotesWithNewRatings is not provided"
     notesWithNewRatings = set(
       ratings.loc[ratings[c.createdAtMillisKey] > previousRatingCutoffTimestampMillis, c.noteIdKey]
     )
@@ -1782,10 +1907,10 @@ def determine_which_notes_to_rescore(
         * {len(recentlyFlippedNotesNotRescoredRecentlyEnough)} notes that flipped status recently and not rescored recently enough.
         * {len(nmrDueToMinStableCrhTimeNotes)} notes that were NMRed due to MinStableCrhTime was not met.
         * {len(lockingEligibleUnlockedNotes)} recent notes that are eligible to lock but haven't locked yet.
-      Overall: {len(notesToRescoreSet)} notes to rescore, out of {len(notes)} total.\n----"""
+      Overall: {len(notesToRescoreSet)} notes to rescore, out of {len(noteStatusHistory)} in noteStatusHistory.\n----"""
   )
 
-  return noteSubsets, notesToRescoreSet
+  return c.NotesToRescore(noteSubsets=noteSubsets, noteIds=notesToRescoreSet)
 
 
 def run_final_note_scoring(
@@ -1813,6 +1938,7 @@ def run_final_note_scoring(
   enableNmrDueToMinStableCrhTime: bool = True,
   maxWorkers: Optional[int] = None,
   empiricalTotals: Optional[pd.DataFrame] = None,
+  notesToRescore: Optional[c.NotesToRescore] = None,
 ):
   metrics = {}
   with c.time_block("Logging Final Scoring RAM usage"):
@@ -1906,10 +2032,13 @@ def run_final_note_scoring(
         ),
       ]
 
-      noteSubsetsForProdScoring, _ = determine_which_notes_to_rescore(
-        notes, ratings, noteStatusHistory, previousRatingCutoffTimestampMillis
-      )
-      for noteSubset in noteSubsetsForProdScoring:
+      if notesToRescore is None:
+        notesToRescore = determine_which_notes_to_rescore(
+          noteStatusHistory=noteStatusHistory,
+          previousRatingCutoffTimestampMillis=previousRatingCutoffTimestampMillis,
+          ratings=ratings,
+        )
+      for noteSubset in notesToRescore.noteSubsets:
         if noteSubset.description == c.RescoringRuleID.NEW_NOTES_NOT_RESCORED_RECENTLY_ENOUGH:
           noteSubsets.append(noteSubset)
     else:
@@ -1917,9 +2046,15 @@ def run_final_note_scoring(
       assert previousRatingCutoffTimestampMillis is not None
       logger.info("Previous scored notes passed; determining which notes to rescore.")
       # Filter all datasets to smaller versions which only contain notes which need to be scored.
-      noteSubsets, notesToRescoreSet = determine_which_notes_to_rescore(
-        notes, ratings, noteStatusHistory, previousRatingCutoffTimestampMillis
-      )
+      if notesToRescore is None:
+        notesToRescore = determine_which_notes_to_rescore(
+          noteStatusHistory=noteStatusHistory,
+          previousRatingCutoffTimestampMillis=previousRatingCutoffTimestampMillis,
+          ratings=ratings,
+        )
+      else:
+        logger.info("Using precomputed NotesToRescore from merge.")
+      noteSubsets, notesToRescoreSet = notesToRescore.noteSubsets, notesToRescore.noteIds
 
       scoredNotesPassthrough = previousScoredNotes[
         ~previousScoredNotes[c.noteIdKey].isin(notesToRescoreSet)
@@ -1983,6 +2118,41 @@ def run_final_note_scoring(
   # system tests run with full scale data and previousScoredNotes=None.
   maxWorkers = maxWorkers or (4 if previousScoredNotes is None else 6)
   logger.info(f"Number of concurrent scoring workers: {maxWorkers}")
+
+  # Convert participant IDs from strings to Int64 to reduce memory during parallel scoring.
+  # Same optimization used in run_prescoring.
+  idConversion = False
+  idCodebook = None
+  try:
+    ratingIds = ratings[c.raterParticipantIdKey].astype("int64[pyarrow]")
+    noteStatusHistoryIds = noteStatusHistory[c.noteAuthorParticipantIdKey].astype("int64[pyarrow]")
+    userEnrollmentIds = userEnrollment[c.participantIdKey].astype("int64[pyarrow]")
+    prescoringRaterIds = prescoringRaterModelOutput[c.raterParticipantIdKey].astype(
+      "int64[pyarrow]"
+    )
+    ratings[c.raterParticipantIdKey] = ratingIds
+    noteStatusHistory[c.noteAuthorParticipantIdKey] = noteStatusHistoryIds
+    userEnrollment[c.participantIdKey] = userEnrollmentIds
+    prescoringRaterModelOutput[c.raterParticipantIdKey] = prescoringRaterIds
+    del ratingIds, noteStatusHistoryIds, userEnrollmentIds, prescoringRaterIds
+    logger.info("Final scoring: converted participant IDs to int64[pyarrow] for memory reduction.")
+    idConversion = True
+  except ValueError as e:
+    logger.info(
+      f"Final scoring: ID conversion to Int64 failed. Falling back to a factorized codebook. {repr(e)}"
+    )
+    # Public-data path: factorize string IDs to ints (result-neutral, restored before output).
+    idCodebook = _build_participant_id_codebook(
+      [
+        (ratings, c.raterParticipantIdKey),
+        (noteStatusHistory, c.noteAuthorParticipantIdKey),
+        (userEnrollment, c.participantIdKey),
+        (prescoringRaterModelOutput, c.raterParticipantIdKey),
+      ]
+    )
+    idConversion = True
+    logger.info("Final scoring: participant IDs factorized to int64[pyarrow] using a shared codebook.")
+
   modelResults = _run_scorers(
     args,
     scorers=list(chain(*scorers.values())),
@@ -2000,6 +2170,29 @@ def run_final_note_scoring(
     dataLoader=dataLoader,
     maxWorkers=maxWorkers,
   )
+
+  # Restore string IDs now that parallel scoring is complete.
+  if idConversion:
+    if idCodebook is not None:
+      _decode_participant_ids(
+        [
+          (ratings, c.raterParticipantIdKey),
+          (noteStatusHistory, c.noteAuthorParticipantIdKey),
+          (userEnrollment, c.participantIdKey),
+          (prescoringRaterModelOutput, c.raterParticipantIdKey),
+        ],
+        idCodebook,
+      )
+    else:
+      ratings[c.raterParticipantIdKey] = ratings[c.raterParticipantIdKey].astype(str)
+      noteStatusHistory[c.noteAuthorParticipantIdKey] = noteStatusHistory[
+        c.noteAuthorParticipantIdKey
+      ].astype(str)
+      userEnrollment[c.participantIdKey] = userEnrollment[c.participantIdKey].astype(str)
+      prescoringRaterModelOutput[c.raterParticipantIdKey] = prescoringRaterModelOutput[
+        c.raterParticipantIdKey
+      ].astype(str)
+    logger.info("Final scoring: restored participant IDs to strings.")
 
   scoredNotes, auxiliaryNoteInfo = combine_final_scorer_results(modelResults, noteStatusHistory)
 
@@ -2040,7 +2233,6 @@ def run_final_note_scoring(
     scoredNotesPassthrough[c.rescoringActiveRulesKey] = ""
     scoredNotes = pd.concat(
       [scoredNotes, scoredNotesPassthrough],
-      unsafeAllowed=[c.topicNoteConfidentKey],  # concat 'O' with BooleanDtype
     )
 
     # Convert auxiliaryNoteInfo dtypes to match auxiliaryNoteInfoPassthrough
@@ -2315,6 +2507,143 @@ def run_scoring(
   )
 
   logger.info("Starting contributor scoring")
+
+  helpfulnessScores = run_contributor_scoring(
+    ratings=ratings,
+    scoredNotes=scoredNotes,
+    auxiliaryNoteInfo=auxiliaryNoteInfo,
+    prescoringRaterModelOutput=prescoringRaterModelOutput,
+    noteStatusHistory=newNoteStatusHistory,
+    userEnrollment=userEnrollment,
+    strictColumns=strictColumns,
+  )
+
+  return scoredNotes, helpfulnessScores, newNoteStatusHistory, auxiliaryNoteInfo
+
+
+def run_prescoring_phase(
+  args,
+  notes: pd.DataFrame,
+  ratings: pd.DataFrame,
+  noteStatusHistory: pd.DataFrame,
+  userEnrollment: pd.DataFrame,
+  seed: Optional[int] = None,
+  enabledScorers: Optional[Set[Scorers]] = None,
+  runParallel: bool = True,
+  dataLoader: Optional[CommunityNotesDataLoader] = None,
+  useStableInitialization: bool = True,
+  cutoffTimestampMillis: Optional[int] = None,
+  excludeRatingsAfterANoteGotFirstStatusPlusNHours: Optional[int] = None,
+  daysInPastToApplyPostFirstStatusFiltering: Optional[int] = 14,
+  filterPrescoringInputToSimulateDelayInHours: Optional[int] = None,
+  previousRatingCutoffTimestampMillis: Optional[int] = 0,
+):
+  """Run only the prescoring phase as a standalone process.
+
+  This mirrors the prescoring portion of run_scoring so that prescoring and final scoring can
+  be run as separate processes (as they are in production). Running them separately means the
+  prescoring working set is reclaimed by process exit before final scoring begins, lowering peak
+  RAM. The returned tuple matches run_prescoring's return so it can be written to disk with
+  process_data.write_prescoring_output (empiricalTotals must be persisted separately).
+  """
+  notes, ratings, prescoringNotesInput, prescoringRatingsInput = filter_input_data_for_testing(
+    notes,
+    ratings,
+    noteStatusHistory,
+    cutoffTimestampMillis,
+    excludeRatingsAfterANoteGotFirstStatusPlusNHours,
+    daysInPastToApplyPostFirstStatusFiltering,
+    filterPrescoringInputToSimulateDelayInHours,
+  )
+
+  postSelectionSimilarityValues = run_rater_clustering(notes=notes, ratings=ratings)
+
+  return run_prescoring(
+    args,
+    notes=prescoringNotesInput,
+    ratings=prescoringRatingsInput,
+    noteStatusHistory=noteStatusHistory,
+    userEnrollment=userEnrollment,
+    postSelectionSimilarityValues=postSelectionSimilarityValues,
+    seed=seed,
+    enabledScorers=enabledScorers,
+    runParallel=runParallel,
+    dataLoader=dataLoader,
+    useStableInitialization=useStableInitialization,
+    checkFlips=False,
+    previousRatingCutoffTimestampMillis=previousRatingCutoffTimestampMillis,
+  )
+
+
+def run_final_phase(
+  args,
+  notes: pd.DataFrame,
+  ratings: pd.DataFrame,
+  noteStatusHistory: pd.DataFrame,
+  userEnrollment: pd.DataFrame,
+  prescoringNoteModelOutput: pd.DataFrame,
+  prescoringRaterModelOutput: pd.DataFrame,
+  noteTopicClassifier: sklearn.pipeline.Pipeline,
+  pflipClassifier: PFlipPlusModel,
+  prescoringMetaOutput: c.PrescoringMetaOutput,
+  empiricalTotals: Optional[pd.DataFrame] = None,
+  seed: Optional[int] = None,
+  pseudoraters: Optional[bool] = True,
+  enabledScorers: Optional[Set[Scorers]] = None,
+  strictColumns: bool = True,
+  runParallel: bool = True,
+  dataLoader: Optional[CommunityNotesDataLoader] = None,
+  useStableInitialization: bool = True,
+  checkFlips: bool = True,
+  previousScoredNotes: Optional[pd.DataFrame] = None,
+  previousAuxiliaryNoteInfo: Optional[pd.DataFrame] = None,
+  previousRatingCutoffTimestampMillis: Optional[int] = 0,
+  cutoffTimestampMillis: Optional[int] = None,
+  excludeRatingsAfterANoteGotFirstStatusPlusNHours: Optional[int] = None,
+  daysInPastToApplyPostFirstStatusFiltering: Optional[int] = 14,
+  filterPrescoringInputToSimulateDelayInHours: Optional[int] = None,
+):
+  """Run final note scoring and contributor scoring as a standalone process.
+
+  This mirrors the final-scoring and contributor-scoring portion of run_scoring. Prescoring
+  outputs are passed in (loaded from disk) rather than recomputed in-process. The input filtering
+  is recomputed with the same args so notes/ratings match the single-process path; final scoring
+  does not need the rater clustering values (only prescoring does).
+  """
+  notes, ratings, _, _ = filter_input_data_for_testing(
+    notes,
+    ratings,
+    noteStatusHistory,
+    cutoffTimestampMillis,
+    excludeRatingsAfterANoteGotFirstStatusPlusNHours,
+    daysInPastToApplyPostFirstStatusFiltering,
+    filterPrescoringInputToSimulateDelayInHours,
+  )
+
+  scoredNotes, newNoteStatusHistory, auxiliaryNoteInfo, _ = run_final_note_scoring(
+    args,
+    notes=notes,
+    ratings=ratings,
+    noteStatusHistory=noteStatusHistory,
+    userEnrollment=userEnrollment,
+    seed=seed,
+    pseudoraters=pseudoraters,
+    enabledScorers=enabledScorers,
+    strictColumns=strictColumns,
+    runParallel=runParallel,
+    dataLoader=dataLoader,
+    useStableInitialization=useStableInitialization,
+    prescoringNoteModelOutput=prescoringNoteModelOutput,
+    prescoringRaterModelOutput=prescoringRaterModelOutput,
+    noteTopicClassifier=noteTopicClassifier,
+    pflipClassifier=pflipClassifier,
+    prescoringMetaOutput=prescoringMetaOutput,
+    checkFlips=checkFlips,
+    previousScoredNotes=previousScoredNotes,
+    previousAuxiliaryNoteInfo=previousAuxiliaryNoteInfo,
+    previousRatingCutoffTimestampMillis=previousRatingCutoffTimestampMillis,
+    empiricalTotals=empiricalTotals,
+  )
 
   helpfulnessScores = run_contributor_scoring(
     ratings=ratings,

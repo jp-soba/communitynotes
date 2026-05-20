@@ -65,6 +65,8 @@ class RuleID(Enum):
   GROUP_MODEL_12 = RuleAndVersion("GroupModel12", "1.1", True)
   GROUP_MODEL_13 = RuleAndVersion("GroupModel13", "1.1", True)
   GROUP_MODEL_14 = RuleAndVersion("GroupModel14", "1.1", True)
+  GROUP_MODEL_18 = RuleAndVersion("GroupModel18", "1.1", True)
+  GROUP_MODEL_18_NMR = RuleAndVersion("GroupModel18NMR", "1.1", True)
   GROUP_MODEL_33 = RuleAndVersion("GroupModel33", "1.1", True)
   GROUP_MODEL_33_NMR = RuleAndVersion("GroupModel33NMR", "1.1", True)
   TOPIC_MODEL_1 = RuleAndVersion("TopicModel01", "1.0", False)
@@ -314,7 +316,6 @@ class FilterTagOutliers(ScoringRule):
       ][c.noteIdKey]
       impactedNotes = pd.concat(
         [impactedNotes, pd.DataFrame({c.noteIdKey: tagFilteredNotes, c.activeFilterTagsKey: tag})],
-        unsafeAllowed=[c.defaultIndexKey, c.activeFilterTagsKey],
       )
     # log and consolidate imapcted notes
     logger.info(f"Total {{note, tag}} pairs where tag filter logic triggered: {len(impactedNotes)}")
@@ -1698,12 +1699,7 @@ def apply_scoring_rules(
         assert set(noteStatusUpdates[c.noteIdKey]) == set(additionalColumns[c.noteIdKey])
 
       # Update noteLabels, which will always hold at most one label per note.
-      unsafeAllowed = {c.internalRatingStatusKey, c.finalRatingStatusKey, c.defaultIndexKey}
-      noteLabels = (
-        pd.concat([noteLabels, noteStatusUpdates], unsafeAllowed=unsafeAllowed)
-        .groupby(c.noteIdKey)
-        .tail(1)
-      )
+      noteLabels = pd.concat([noteLabels, noteStatusUpdates]).groupby(c.noteIdKey).tail(1)
       # Update note rules to have one row per rule which was active for a note
       noteRules = pd.concat(
         [
@@ -1712,14 +1708,11 @@ def apply_scoring_rules(
             {c.noteIdKey: noteStatusUpdates[c.noteIdKey], ruleColumn: rule.get_name()}
           ),
         ],
-        unsafeAllowed={c.internalActiveRulesKey, c.defaultIndexKey, c.metaScorerActiveRulesKey},
       )
       if additionalColumns is not None:
         # Merge any additional columns into current set of new columns
         assert {c.noteIdKey} == (set(noteColumns.columns) & set(additionalColumns.columns))
-        noteColumns = noteColumns.merge(
-          additionalColumns, on=c.noteIdKey, how="outer", unsafeAllowed=c.defaultIndexKey
-        )
+        noteColumns = noteColumns.merge(additionalColumns, on=c.noteIdKey, how="outer")
 
   with c.time_block("Condense noteRules after applying all scoring rules"):
     # Having applied all scoring rules, condense noteRules to have one row per note representing
