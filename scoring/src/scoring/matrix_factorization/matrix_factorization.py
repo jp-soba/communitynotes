@@ -1,6 +1,5 @@
 import dataclasses
 import logging
-import math
 import time
 from typing import List, Optional, Tuple
 
@@ -469,165 +468,6 @@ class MatrixFactorization:
 
     return l2_reg_loss
 
-  def _data_loss_terms(self, modelData: ModelData, start: int, end: int) -> torch.Tensor:
-    """Per-rating (optionally NormalizedLoss-weighted) loss for modelData[start:end].
-
-    Mirrors the data-loss term used by _get_loss: when a NormalizedLoss module is active the
-    precomputed per-rating weights are applied, otherwise the bare criterion is used. Slicing
-    produces tensor views, so no per-rating data is copied.
-    """
-    chunk = ModelData(
-      modelData.rating_labels[start:end],
-      modelData.user_indexes[start:end],
-      modelData.note_indexes[start:end],
-    )
-    pred = self.mf_model(chunk)
-    if self._lossModule is not None:
-      return self._lossModule.weights[start:end] * self._lossModule.loss_fn(
-        pred, self._lossModule.targets[start:end]
-      )
-    return self.criterion(pred, chunk.rating_labels)
-
-  def _accumulate_chunked_gradients(self, chunkSize: int, n: int) -> float:
-    """Accumulate the full-batch gradient over chunks and return the scalar regularized loss.
-
-    Each chunk contributes (sum of its per-rating loss terms) / n, so summing the chunks yields
-    the same mean data loss as the full-batch path, and calling backward() per chunk accumulates
-    the same total gradient while only one chunk's autograd graph is alive at a time. The
-    regularization loss depends only on parameters and is added once.
-    """
-    total = 0.0
-    for start in range(0, n, chunkSize):
-      end = min(start + chunkSize, n)
-      chunkLoss = self._data_loss_terms(self.trainModelData, start, end).sum() / n
-      chunkLoss.backward()
-      total += chunkLoss.item()
-    regularizationLoss = self._get_reg_loss()
-    regularizationLoss.backward()
-    return total + regularizationLoss.item()
-
-  def _chunked_loss_value(self, modelData: ModelData, chunkSize: int, includeReg: bool) -> float:
-    """Scalar (mean data loss [+ reg]) computed over chunks without building an autograd graph."""
-    n = len(modelData.rating_labels)
-    with torch.no_grad():
-      total = 0.0
-      for start in range(0, n, chunkSize):
-        end = min(start + chunkSize, n)
-        total += self._data_loss_terms(modelData, start, end).sum().item()
-      value = total / n
-      if includeReg:
-        value += self._get_reg_loss().item()
-    return value
-
-  def _reinit_model_on_nan(self):
-    """Re-initialize the model exactly as _get_loss does when a NaN loss is encountered."""
-    if isinstance(self._lossModule, NormalizedLoss):
-      self._create_mf_model(None, self.userInit, None)
-    else:
-      self._create_mf_model(self.noteInit, self.userInit, self.globalInterceptInit)
-
-  def _print_loss_chunked(
-    self, loss_value: float, epoch: int, chunkSize: int, run_name: str = "", final: bool = False
-  ) -> Tuple[float, float, Optional[float]]:
-    """Chunked, no-grad analog of _compute_and_print_loss to avoid a full-batch forward."""
-    assert self.mf_model is not None
-    assert self.trainModelData is not None
-    nTrain = len(self.trainModelData.rating_labels)
-    with torch.no_grad():
-      trainTotal = 0.0
-      for start in range(0, nTrain, chunkSize):
-        end = min(start + chunkSize, nTrain)
-        chunk = ModelData(
-          self.trainModelData.rating_labels[start:end],
-          self.trainModelData.user_indexes[start:end],
-          self.trainModelData.note_indexes[start:end],
-        )
-        trainTotal += self.criterion(self.mf_model(chunk), chunk.rating_labels).sum().item()
-      train_loss_value = trainTotal / nTrain
-
-      if self.validateModelData is not None:
-        nVal = len(self.validateModelData.rating_labels)
-        valTotal = 0.0
-        for start in range(0, nVal, chunkSize):
-          end = min(start + chunkSize, nVal)
-          chunk = ModelData(
-            self.validateModelData.rating_labels[start:end],
-            self.validateModelData.user_indexes[start:end],
-            self.validateModelData.note_indexes[start:end],
-          )
-          valTotal += self.criterion(self.mf_model(chunk), chunk.rating_labels).sum().item()
-        validate_loss_value = valTotal / nVal
-      else:
-        validate_loss_value = None
-
-    metrics = {
-      f"{run_name}Loss/train_fit": train_loss_value,
-      f"{run_name}Loss/regularized": loss_value,
-    }
-    if validate_loss_value is not None:
-      metrics[f"{run_name}Loss/validate_fit"] = validate_loss_value
-
-    if self._log:
-      logger.info(f"epoch {epoch} {loss_value}")
-      logger.info(f"TRAIN FIT LOSS: {train_loss_value}")
-      if validate_loss_value is not None:
-        logger.info(f"VALIDATE FIT LOSS: {validate_loss_value}")
-
-    wandb.log(metrics, step=epoch, commit=False)
-
-    if final:
-      self.test_errors.append(loss_value)
-      self.train_errors.append(train_loss_value)
-
-    return train_loss_value, loss_value, validate_loss_value
-
-  def _fit_model_chunked(
-    self,
-    chunkSize: int,
-    print_interval: int = 20,
-    run_name: str = "",
-  ) -> Tuple[float, float, Optional[float]]:
-    """Gradient-accumulation equivalent of the full-batch loop in _fit_model.
-
-    Produces the same parameter trajectory (one optimizer step per full pass over the data) as
-    the full-batch path, up to floating-point summation order, while only ever holding one
-    chunk's autograd graph in memory.
-    """
-    assert self.trainModelData is not None
-    n = len(self.trainModelData.rating_labels)
-
-    prev_loss = 1e10
-    loss_value = self._chunked_loss_value(self.trainModelData, chunkSize, includeReg=True)
-    if math.isnan(loss_value):
-      self._reinit_model_on_nan()
-      loss_value = self._chunked_loss_value(self.trainModelData, chunkSize, includeReg=True)
-    epoch = 0
-
-    while (abs(loss_value - prev_loss) > self._convergence) and (
-      not (epoch > 100 and loss_value > prev_loss)
-    ):
-      prev_loss = loss_value
-
-      self.optimizer.zero_grad()
-      self._accumulate_chunked_gradients(chunkSize, n)
-      torch.nn.utils.clip_grad_norm_(self.mf_model.parameters(), max_norm=1.0)
-      self.optimizer.step()
-      self.optimizer.zero_grad()
-
-      loss_value = self._chunked_loss_value(self.trainModelData, chunkSize, includeReg=True)
-      if math.isnan(loss_value):
-        self._reinit_model_on_nan()
-        loss_value = self._chunked_loss_value(self.trainModelData, chunkSize, includeReg=True)
-
-      if epoch % print_interval == 0:
-        self._print_loss_chunked(loss_value, epoch, chunkSize, run_name=run_name, final=False)
-
-      epoch += 1
-
-    if self._log:
-      logger.info(f"Num epochs: {epoch}")
-    return self._print_loss_chunked(loss_value, epoch, chunkSize, run_name=run_name, final=True)
-
   def _fit_model(
     self,
     validate_percent: Optional[float] = None,
@@ -647,10 +487,6 @@ class MatrixFactorization:
     assert self.mf_model is not None
     self._create_train_validate_sets(validate_percent)
     assert self.trainModelData is not None
-
-    chunkSize = c.mfTrainingChunkSize
-    if chunkSize is not None and 0 < chunkSize < len(self.trainModelData.rating_labels):
-      return self._fit_model_chunked(chunkSize, print_interval=print_interval, run_name=run_name)
 
     prev_loss = 1e10
     loss = self._get_loss()
