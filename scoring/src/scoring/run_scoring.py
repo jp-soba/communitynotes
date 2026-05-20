@@ -1369,6 +1369,46 @@ def run_rater_clustering(notes: pd.DataFrame, ratings: pd.DataFrame) -> pd.DataF
   return postSelectionSimilarityValues.merge(quasiCliques, how="outer")
 
 
+def _build_participant_id_codebook(framesAndColumns):
+  """Replace string participant IDs with int64[pyarrow] codes in place, sharing one codebook.
+
+  Generalizes the prod int64[pyarrow] ID optimization to public data, whose participant IDs are
+  non-numeric strings that astype("int64[pyarrow]") cannot convert. Scoring uses participant IDs
+  only as equality/join/group keys, and prod already runs scoring with int64 IDs (restoring
+  strings only for output), so replacing IDs with a consistent bijective integer encoding leaves
+  the scoring output unchanged. A single shared codebook across all columns guarantees the same
+  original ID maps to the same code everywhere (e.g. a note author who is also a rater). Null
+  values are preserved as null.
+
+  Args:
+    framesAndColumns: list of (DataFrame, column name) pairs to encode in place.
+
+  Returns:
+    pd.Index mapping code -> original value, for later decoding with _decode_participant_ids.
+  """
+  combined = pd.concat([df[column] for df, column in framesAndColumns], ignore_index=True)
+  _, codebook = pd.factorize(combined, use_na_sentinel=True)
+  valueToCode = pd.Series(range(len(codebook)), index=codebook)
+  for df, column in framesAndColumns:
+    df[column] = df[column].map(valueToCode).astype("int64[pyarrow]")
+  return codebook
+
+
+def _decode_participant_ids(framesAndColumns, codebook):
+  """Inverse of _build_participant_id_codebook: restore original string IDs from int codes.
+
+  Null codes are preserved as null. The result matches the existing astype(str) restoration so
+  downstream/output behavior is unchanged.
+  """
+  codebookValues = codebook.to_numpy()
+  for df, column in framesAndColumns:
+    codes = df[column]
+    mask = codes.notna()
+    restored = pd.Series(pd.NA, index=codes.index, dtype="object")
+    restored[mask] = codebookValues[codes[mask].astype("int64").to_numpy()]
+    df[column] = restored.astype(str)
+
+
 def run_prescoring(
   args,
   notes: pd.DataFrame,
@@ -1437,6 +1477,7 @@ def run_prescoring(
   # Attempt to convert IDs to Int64 before prescoring.  We expect this to succeed in production,
   # fail when running on public data and fail in some unit tests.
   conversion = False
+  idCodebook = None
   try:
     # Complete all three conversions before doing any updates, so if there are any errors the
     # updates don't happen.
@@ -1452,7 +1493,18 @@ def run_prescoring(
     )
     conversion = True
   except ValueError as e:
-    logger.info(f"Error converting user IDs to ints.  IDs will remain as strings. {repr(e)}")
+    logger.info(f"Error converting user IDs to ints. Falling back to a factorized codebook. {repr(e)}")
+    # On public data the IDs are non-numeric strings, so factorize them to ints instead. This is
+    # result-neutral (prod runs scoring on int IDs too) and restored to strings before output.
+    idCodebook = _build_participant_id_codebook(
+      [
+        (ratings, c.raterParticipantIdKey),
+        (noteStatusHistory, c.noteAuthorParticipantIdKey),
+        (userEnrollment, c.participantIdKey),
+      ]
+    )
+    conversion = True
+    logger.info("User IDs factorized to int64[pyarrow] using a shared codebook.")
   with c.time_block("Logging Prescoring Inputs RAM usage before _run_scorers"):
     logger.info(get_df_info(notes, "notes"))
     logger.info(get_df_info(ratings, "ratings"))
@@ -1493,15 +1545,27 @@ def run_prescoring(
   # Restore IDs as string objects now that prescoring is over and memory pressure is relaxed.
   if conversion:
     logger.info("Restoring string IDs.")
-    ratings[c.raterParticipantIdKey] = ratings[c.raterParticipantIdKey].astype(str)
-    noteStatusHistory[c.noteAuthorParticipantIdKey] = noteStatusHistory[
-      c.noteAuthorParticipantIdKey
-    ].astype(str)
-    userEnrollment[c.participantIdKey] = userEnrollment[c.participantIdKey].astype(str)
-    # Notice that we also do conversion on the prescoring results.
-    prescoringRaterModelOutput[c.raterParticipantIdKey] = prescoringRaterModelOutput[
-      c.raterParticipantIdKey
-    ].astype(str)
+    if idCodebook is not None:
+      # Public-data path: restore original strings via the factorized codebook.
+      _decode_participant_ids(
+        [
+          (ratings, c.raterParticipantIdKey),
+          (noteStatusHistory, c.noteAuthorParticipantIdKey),
+          (userEnrollment, c.participantIdKey),
+          (prescoringRaterModelOutput, c.raterParticipantIdKey),
+        ],
+        idCodebook,
+      )
+    else:
+      ratings[c.raterParticipantIdKey] = ratings[c.raterParticipantIdKey].astype(str)
+      noteStatusHistory[c.noteAuthorParticipantIdKey] = noteStatusHistory[
+        c.noteAuthorParticipantIdKey
+      ].astype(str)
+      userEnrollment[c.participantIdKey] = userEnrollment[c.participantIdKey].astype(str)
+      # Notice that we also do conversion on the prescoring results.
+      prescoringRaterModelOutput[c.raterParticipantIdKey] = prescoringRaterModelOutput[
+        c.raterParticipantIdKey
+      ].astype(str)
     logger.info("Restoration of original string IDs complete.")
 
   with c.time_block("Logging Prescoring Results RAM usage (after conversion)"):
@@ -2058,6 +2122,7 @@ def run_final_note_scoring(
   # Convert participant IDs from strings to Int64 to reduce memory during parallel scoring.
   # Same optimization used in run_prescoring.
   idConversion = False
+  idCodebook = None
   try:
     ratingIds = ratings[c.raterParticipantIdKey].astype("int64[pyarrow]")
     noteStatusHistoryIds = noteStatusHistory[c.noteAuthorParticipantIdKey].astype("int64[pyarrow]")
@@ -2073,7 +2138,20 @@ def run_final_note_scoring(
     logger.info("Final scoring: converted participant IDs to int64[pyarrow] for memory reduction.")
     idConversion = True
   except ValueError as e:
-    logger.info(f"Final scoring: ID conversion to Int64 failed, IDs remain as strings. {repr(e)}")
+    logger.info(
+      f"Final scoring: ID conversion to Int64 failed. Falling back to a factorized codebook. {repr(e)}"
+    )
+    # Public-data path: factorize string IDs to ints (result-neutral, restored before output).
+    idCodebook = _build_participant_id_codebook(
+      [
+        (ratings, c.raterParticipantIdKey),
+        (noteStatusHistory, c.noteAuthorParticipantIdKey),
+        (userEnrollment, c.participantIdKey),
+        (prescoringRaterModelOutput, c.raterParticipantIdKey),
+      ]
+    )
+    idConversion = True
+    logger.info("Final scoring: participant IDs factorized to int64[pyarrow] using a shared codebook.")
 
   modelResults = _run_scorers(
     args,
@@ -2095,14 +2173,25 @@ def run_final_note_scoring(
 
   # Restore string IDs now that parallel scoring is complete.
   if idConversion:
-    ratings[c.raterParticipantIdKey] = ratings[c.raterParticipantIdKey].astype(str)
-    noteStatusHistory[c.noteAuthorParticipantIdKey] = noteStatusHistory[
-      c.noteAuthorParticipantIdKey
-    ].astype(str)
-    userEnrollment[c.participantIdKey] = userEnrollment[c.participantIdKey].astype(str)
-    prescoringRaterModelOutput[c.raterParticipantIdKey] = prescoringRaterModelOutput[
-      c.raterParticipantIdKey
-    ].astype(str)
+    if idCodebook is not None:
+      _decode_participant_ids(
+        [
+          (ratings, c.raterParticipantIdKey),
+          (noteStatusHistory, c.noteAuthorParticipantIdKey),
+          (userEnrollment, c.participantIdKey),
+          (prescoringRaterModelOutput, c.raterParticipantIdKey),
+        ],
+        idCodebook,
+      )
+    else:
+      ratings[c.raterParticipantIdKey] = ratings[c.raterParticipantIdKey].astype(str)
+      noteStatusHistory[c.noteAuthorParticipantIdKey] = noteStatusHistory[
+        c.noteAuthorParticipantIdKey
+      ].astype(str)
+      userEnrollment[c.participantIdKey] = userEnrollment[c.participantIdKey].astype(str)
+      prescoringRaterModelOutput[c.raterParticipantIdKey] = prescoringRaterModelOutput[
+        c.raterParticipantIdKey
+      ].astype(str)
     logger.info("Final scoring: restored participant IDs to strings.")
 
   scoredNotes, auxiliaryNoteInfo = combine_final_scorer_results(modelResults, noteStatusHistory)
