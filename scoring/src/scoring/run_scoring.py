@@ -2430,3 +2430,140 @@ def run_scoring(
   )
 
   return scoredNotes, helpfulnessScores, newNoteStatusHistory, auxiliaryNoteInfo
+
+
+def run_prescoring_phase(
+  args,
+  notes: pd.DataFrame,
+  ratings: pd.DataFrame,
+  noteStatusHistory: pd.DataFrame,
+  userEnrollment: pd.DataFrame,
+  seed: Optional[int] = None,
+  enabledScorers: Optional[Set[Scorers]] = None,
+  runParallel: bool = True,
+  dataLoader: Optional[CommunityNotesDataLoader] = None,
+  useStableInitialization: bool = True,
+  cutoffTimestampMillis: Optional[int] = None,
+  excludeRatingsAfterANoteGotFirstStatusPlusNHours: Optional[int] = None,
+  daysInPastToApplyPostFirstStatusFiltering: Optional[int] = 14,
+  filterPrescoringInputToSimulateDelayInHours: Optional[int] = None,
+  previousRatingCutoffTimestampMillis: Optional[int] = 0,
+):
+  """Run only the prescoring phase as a standalone process.
+
+  This mirrors the prescoring portion of run_scoring so that prescoring and final scoring can
+  be run as separate processes (as they are in production). Running them separately means the
+  prescoring working set is reclaimed by process exit before final scoring begins, lowering peak
+  RAM. The returned tuple matches run_prescoring's return so it can be written to disk with
+  process_data.write_prescoring_output (empiricalTotals must be persisted separately).
+  """
+  notes, ratings, prescoringNotesInput, prescoringRatingsInput = filter_input_data_for_testing(
+    notes,
+    ratings,
+    noteStatusHistory,
+    cutoffTimestampMillis,
+    excludeRatingsAfterANoteGotFirstStatusPlusNHours,
+    daysInPastToApplyPostFirstStatusFiltering,
+    filterPrescoringInputToSimulateDelayInHours,
+  )
+
+  postSelectionSimilarityValues = run_rater_clustering(notes=notes, ratings=ratings)
+
+  return run_prescoring(
+    args,
+    notes=prescoringNotesInput,
+    ratings=prescoringRatingsInput,
+    noteStatusHistory=noteStatusHistory,
+    userEnrollment=userEnrollment,
+    postSelectionSimilarityValues=postSelectionSimilarityValues,
+    seed=seed,
+    enabledScorers=enabledScorers,
+    runParallel=runParallel,
+    dataLoader=dataLoader,
+    useStableInitialization=useStableInitialization,
+    checkFlips=False,
+    previousRatingCutoffTimestampMillis=previousRatingCutoffTimestampMillis,
+  )
+
+
+def run_final_phase(
+  args,
+  notes: pd.DataFrame,
+  ratings: pd.DataFrame,
+  noteStatusHistory: pd.DataFrame,
+  userEnrollment: pd.DataFrame,
+  prescoringNoteModelOutput: pd.DataFrame,
+  prescoringRaterModelOutput: pd.DataFrame,
+  noteTopicClassifier: sklearn.pipeline.Pipeline,
+  pflipClassifier: PFlipPlusModel,
+  prescoringMetaOutput: c.PrescoringMetaOutput,
+  empiricalTotals: Optional[pd.DataFrame] = None,
+  seed: Optional[int] = None,
+  pseudoraters: Optional[bool] = True,
+  enabledScorers: Optional[Set[Scorers]] = None,
+  strictColumns: bool = True,
+  runParallel: bool = True,
+  dataLoader: Optional[CommunityNotesDataLoader] = None,
+  useStableInitialization: bool = True,
+  checkFlips: bool = True,
+  previousScoredNotes: Optional[pd.DataFrame] = None,
+  previousAuxiliaryNoteInfo: Optional[pd.DataFrame] = None,
+  previousRatingCutoffTimestampMillis: Optional[int] = 0,
+  cutoffTimestampMillis: Optional[int] = None,
+  excludeRatingsAfterANoteGotFirstStatusPlusNHours: Optional[int] = None,
+  daysInPastToApplyPostFirstStatusFiltering: Optional[int] = 14,
+  filterPrescoringInputToSimulateDelayInHours: Optional[int] = None,
+):
+  """Run final note scoring and contributor scoring as a standalone process.
+
+  This mirrors the final-scoring and contributor-scoring portion of run_scoring. Prescoring
+  outputs are passed in (loaded from disk) rather than recomputed in-process. The input filtering
+  is recomputed with the same args so notes/ratings match the single-process path; final scoring
+  does not need the rater clustering values (only prescoring does).
+  """
+  notes, ratings, _, _ = filter_input_data_for_testing(
+    notes,
+    ratings,
+    noteStatusHistory,
+    cutoffTimestampMillis,
+    excludeRatingsAfterANoteGotFirstStatusPlusNHours,
+    daysInPastToApplyPostFirstStatusFiltering,
+    filterPrescoringInputToSimulateDelayInHours,
+  )
+
+  scoredNotes, newNoteStatusHistory, auxiliaryNoteInfo, _ = run_final_note_scoring(
+    args,
+    notes=notes,
+    ratings=ratings,
+    noteStatusHistory=noteStatusHistory,
+    userEnrollment=userEnrollment,
+    seed=seed,
+    pseudoraters=pseudoraters,
+    enabledScorers=enabledScorers,
+    strictColumns=strictColumns,
+    runParallel=runParallel,
+    dataLoader=dataLoader,
+    useStableInitialization=useStableInitialization,
+    prescoringNoteModelOutput=prescoringNoteModelOutput,
+    prescoringRaterModelOutput=prescoringRaterModelOutput,
+    noteTopicClassifier=noteTopicClassifier,
+    pflipClassifier=pflipClassifier,
+    prescoringMetaOutput=prescoringMetaOutput,
+    checkFlips=checkFlips,
+    previousScoredNotes=previousScoredNotes,
+    previousAuxiliaryNoteInfo=previousAuxiliaryNoteInfo,
+    previousRatingCutoffTimestampMillis=previousRatingCutoffTimestampMillis,
+    empiricalTotals=empiricalTotals,
+  )
+
+  helpfulnessScores = run_contributor_scoring(
+    ratings=ratings,
+    scoredNotes=scoredNotes,
+    auxiliaryNoteInfo=auxiliaryNoteInfo,
+    prescoringRaterModelOutput=prescoringRaterModelOutput,
+    noteStatusHistory=newNoteStatusHistory,
+    userEnrollment=userEnrollment,
+    strictColumns=strictColumns,
+  )
+
+  return scoredNotes, helpfulnessScores, newNoteStatusHistory, auxiliaryNoteInfo
