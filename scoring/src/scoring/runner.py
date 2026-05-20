@@ -181,6 +181,18 @@ def parse_args():
     help="Set to sample ratings at random.",
   )
   parser.add_argument(
+    "--mf-chunk-size",
+    default=None,
+    type=int,
+    dest="mf_chunk_size",
+    help=(
+      "If set to a positive int, train matrix factorization with gradient accumulation over "
+      "rating chunks of this size instead of a single full-batch step. This is mathematically "
+      "equivalent to full-batch training (one optimizer step per full pass) but only holds one "
+      "chunk's autograd graph in memory at a time, lowering peak RAM. Trades speed for memory."
+    ),
+  )
+  parser.add_argument(
     "--phase",
     default="all",
     choices=["all", "prescoring", "final"],
@@ -268,6 +280,8 @@ def _run_scorer(
   if args.epoch_millis:
     c.epochMillis = args.epoch_millis
     c.useCurrentTimeInsteadOfEpochMillisForNoteStatusHistory = False
+  if args.mf_chunk_size is not None:
+    c.mfTrainingChunkSize = args.mf_chunk_size
 
   # Load input dataframes.
   if dataLoader is None:

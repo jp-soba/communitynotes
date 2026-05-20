@@ -28,6 +28,12 @@ defaultNumThreads = os.cpu_count() or 8
 # https://docs.python.org/3/tutorial/modules.html#more-on-modules
 epochMillis = 1000 * time.time()
 useCurrentTimeInsteadOfEpochMillisForNoteStatusHistory = True
+# Optional matrix factorization training chunk size. When set to a positive int, MF training
+# computes the forward/backward pass over ratings in chunks of this size and accumulates the
+# gradient before each optimizer step (gradient accumulation). This is mathematically equivalent
+# to the default full-batch step (one optimizer step per full pass) but only holds one chunk's
+# autograd graph in memory at a time, lowering peak RAM. None (default) keeps full-batch training.
+mfTrainingChunkSize: int = None
 # Use this size threshld to isolate code which should be run differently in small
 # scale unit tests.
 minNumNotesForProdData = 200
