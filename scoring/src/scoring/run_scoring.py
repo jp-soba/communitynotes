@@ -1411,9 +1411,11 @@ def _decode_participant_ids(framesAndColumns, codebook):
   """
   codebookValues = codebook.to_numpy()
   for df, column in framesAndColumns:
-    df[column] = pd.Series(
-      codebookValues[df[column].to_numpy()], index=df[column].index
-    ).astype(str)
+    # Concatenating per-scorer outputs (some empty) can upcast the int64 codes to object/float
+    # dtype, which cannot index codebookValues. The codes are always valid integers, so coerce
+    # back to int64 before decoding.
+    codes = df[column].astype("int64").to_numpy()
+    df[column] = pd.Series(codebookValues[codes], index=df[column].index).astype(str)
 
 
 def run_prescoring(
